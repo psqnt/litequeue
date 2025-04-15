@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Sqlite
+*.db
+*.db-shm
+*.db-wal

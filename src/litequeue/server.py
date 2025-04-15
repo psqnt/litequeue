@@ -7,7 +7,7 @@ import click
 import uvloop
 
 from typing import Optional
-from .parser import RespParser
+from respparser.parser import RespParser, RespSerializer
 from . import logger
 from datetime import datetime, timezone
 
@@ -29,8 +29,13 @@ COMPLETE_STATE = "complete"
 
 
 # QUEUE Configuration
-QUEUE_LPUSH_BATCH_SIZE = 100
-QUEUE_LPUSH_BATCH_INTERVAL = 0.01
+QUEUE_LPUSH_BATCH_MIN_SIZE = 100
+QUEUE_LPUSH_BATCH_MAX_SIZE = 100_000
+QUEUE_LPUSH_BATCH_MIN_INTERVAL = 0.05
+QUEUE_LPUSH_BATCH_MAX_INTERVAL = 5
+
+# Retry Options
+DB_RETRY_ATTEMPTS = 100
 
 # TCP Server Settings
 TCP_BACKLOG = 100
@@ -60,11 +65,22 @@ class LiteQueue:
         self.host = host
         self.port = port
         self.parser = RespParser()
+        self.serializer = RespSerializer()
         self.lpush_buffer = []
-        self.batch_size = QUEUE_LPUSH_BATCH_SIZE  # Commit every X LPUSHes
-        self.batch_interval = QUEUE_LPUSH_BATCH_INTERVAL
+        self.batch_size = QUEUE_LPUSH_BATCH_MIN_SIZE  # Commit every X LPUSHes
+        self.batch_interval = QUEUE_LPUSH_BATCH_MIN_INTERVAL
         self._lock = asyncio.Lock()
         self._running = True
+        self._retry_attempts = DB_RETRY_ATTEMPTS
+        # Adaptive batch settings
+        self._min_batch_size = QUEUE_LPUSH_BATCH_MIN_SIZE
+        self._max_batch_size = QUEUE_LPUSH_BATCH_MAX_SIZE
+        self._min_batch_interval = QUEUE_LPUSH_BATCH_MIN_INTERVAL  # seconds
+        self._max_batch_interval = QUEUE_LPUSH_BATCH_MAX_INTERVAL  # seconds
+        self.batch_size = self._min_batch_size
+        self.batch_interval = self._min_batch_interval
+        self._request_count = 0  # Track requests for load
+        self._last_adjust_time = asyncio.get_event_loop().time()
 
     async def read_complete_command(self, reader: asyncio.StreamReader) -> bytes:
         line = await reader.readline()
@@ -87,11 +103,20 @@ class LiteQueue:
         """Add a task to the left of the queue."""
         task = (queue, payload, PENDING_STATE, str_now())
         async with self._lock:
+            self._request_count += 1
             self.lpush_buffer.append(task)
             should_commit = self._lpush_buffer_full() or commit_now
         if should_commit:
-            await self._commit_lpush_batch()
+            asyncio.create_task(self._commit_lpush_batch())
         return True
+
+    async def _lpush_insert_commit(self, buffer_to_commit) -> None:
+        await db.executemany(
+            "INSERT INTO tasks (queue, payload, state, created) VALUES (?, ?, ?, ?)",
+            buffer_to_commit,
+        )
+        await db.commit()
+        logger.info(f"Committed {len(buffer_to_commit)} LPUSH tasks")
 
     async def _commit_lpush_batch(self) -> None:
         async with self._lock:
@@ -100,25 +125,17 @@ class LiteQueue:
             buffer_to_commit = self.lpush_buffer.copy()
             self.lpush_buffer.clear()
         try:
-            await db.executemany(
-                "INSERT INTO tasks (queue, payload, state, created) VALUES (?, ?, ?, ?)",
-                buffer_to_commit,
-            )
-            await db.commit()
-            logger.warning(f"Committed {len(buffer_to_commit)} LPUSH tasks")
+            await self._lpush_insert_commit(buffer_to_commit)
         except aiosqlite.Error as e:
             logger.error(f"SQLite error in LPUSH commit: {e}")
             await db.rollback()
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in LPUSH commit: {e}")
-            await db.rollback()
-            raise
+            async with self._lock:
+                # Re-add failed batch to front of buffer
+                self.lpush_buffer = buffer_to_commit + self.lpush_buffer
+            asyncio.create_task(self._commit_lpush_batch())
 
     def _lpush_buffer_full(self) -> bool:
-        if len(self.lpush_buffer) >= self.batch_size:
-            return True
-        return False
+        return len(self.lpush_buffer) >= self.batch_size
 
     async def rpop(self, queue: str) -> str | None:
         """Remove and return the task from the right of the queue."""
@@ -174,19 +191,19 @@ class LiteQueue:
                     if not data:
                         break
                     logger.debug(f"Raw: {data}")
-                    command = self.parser.parse(data)
+                    command = [cmd.decode() for cmd in self.parser.parse(data)]
                     logger.info(f"Received from {addr}: {command!r}")
                     cmd = command[0].upper() if command else ""
                     if cmd == "LPUSH" and len(command) == 3:
                         queue, payload = command[1], command[2]
                         await self.lpush(queue, payload)
-                        writer.write(self.parser.serialize(OK))
+                        writer.write(self.serializer.serialize(OK))
                     elif cmd == "RPOP" and len(command) == 2:
                         queue = command[1]
                         value = await self.rpop(queue)
-                        writer.write(self.parser.serialize(value))
+                        writer.write(self.serializer.serialize(value))
                     else:
-                        writer.write(self.parser.serialize("-ERR invalid command"))
+                        writer.write(self.serializer.serialize("-ERR invalid command"))
                     await writer.drain()
                 except (
                     ConnectionResetError,
@@ -202,7 +219,7 @@ class LiteQueue:
                         pass
                     logger.error(f"Unexpected error with {addr}: {e}")
                     if not writer.is_closing():
-                        writer.write(self.parser.serialize(f"-ERR {str(e)}"))
+                        writer.write(self.serializer.serialize(f"-ERR {str(e)}"))
                         await writer.drain()
                     break
         finally:
@@ -231,7 +248,44 @@ class LiteQueue:
                 completed TEXT
             )
         """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_state_queue ON tasks (state, queue)"
+        )
         await db.commit()
+
+    async def _adjust_batch_settings(self):
+        """Adjust batch size and interval based on load every 10s."""
+        while self._running:
+            await asyncio.sleep(2)  # Check every 5s
+            current_time = asyncio.get_event_loop().time()
+            elapsed = current_time - self._last_adjust_time
+            if elapsed > 0:
+                rate = self._request_count / elapsed  # Requests per second
+                self._request_count = 0
+                self._last_adjust_time = current_time
+                # Linear scaling between min and max based on rate
+                # Assume 100 rps = min, 20,000 rps = max
+                load_factor = min(max((rate - 100) / (20000 - 100), 0), 1)
+                new_batch_size = int(
+                    self._min_batch_size
+                    + (self._max_batch_size - self._min_batch_size) * load_factor
+                )
+                new_interval = (
+                    self._min_batch_interval
+                    + (self._max_batch_interval - self._min_batch_interval)
+                    * load_factor
+                )
+                async with self._lock:
+                    self.batch_size = max(
+                        self._min_batch_size, min(new_batch_size, self._max_batch_size)
+                    )
+                    self.batch_interval = max(
+                        self._min_batch_interval,
+                        min(new_interval, self._max_batch_interval),
+                    )
+                logger.warning(
+                    f"Adjusted batch_size={self.batch_size}, batch_interval={self.batch_interval:.2f}s, rate={rate:.0f} rps"
+                )
 
     async def run(self) -> None:
         await self.init_db()
@@ -244,7 +298,8 @@ class LiteQueue:
         )
         addr = server.sockets[0].getsockname()
         logger.info(f"Server running on {addr}")
-        commit_task = asyncio.create_task(self._batch_commit_task())
+        # commit_task = asyncio.create_task(self._batch_commit_task())
+        adjust_task = asyncio.create_task(self._adjust_batch_settings())
         try:
             async with server:
                 await server.serve_forever()
@@ -255,9 +310,11 @@ class LiteQueue:
             self._running = False
             # Give it a chance to finish one last commit
             await asyncio.sleep(self.batch_interval + 0.1)
-            commit_task.cancel()
+            # commit_task.cancel()
+            adjust_task.cancel()
             try:
-                await commit_task  # Wait for it to finish
+                # await commit_task  # Wait for it to finish
+                await adjust_task
             except asyncio.CancelledError:
                 logger.debug("Commit task cancelled")
             await self._commit_lpush_batch()

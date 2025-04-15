@@ -13,6 +13,7 @@ dependencies = [
     "click>=8.1.8",
     "colorlog>=6.9.0",
     "pyyaml>=6.0.2",
+    "respparser",
     "uvloop>=0.21.0",
 ]
 
@@ -22,3 +23,6 @@ litequeue = "litequeue.server:start"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+respparser = { git = "https://github.com/psqnt/respparser" }
