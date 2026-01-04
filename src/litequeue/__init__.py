@@ -17,7 +17,5 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 from .server import LiteQueue
-from .parser import RespParser
 
-
-__all__ = ["LiteQueue", "RespParser", "logger"]
+__all__ = ["LiteQueue", "logger"]

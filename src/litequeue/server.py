@@ -163,7 +163,7 @@ class LiteQueue:
         logger.warning("Started batch_commit")
         while True:
             await asyncio.sleep(self.batch_interval)
-            logger.warnning("batching from timer")
+            logger.warning("batching from timer")
             await self._commit_lpush_batch()
             # await self._commit_rpop_batch()
 

@@ -1,7 +1,7 @@
 [project]
 name = "litequeue"
 version = "0.1.0"
-description = "Add your description here"
+description = "Async python server queue backed by sqlite using RESP"
 readme = "README.md"
 authors = [
     { name = "Joe Pasquantonio", email = "joe.pasquantonio@gmail.com" }
